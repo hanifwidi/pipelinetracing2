@@ -9,15 +9,18 @@ from utils.logger import log
 from utils.benchmark import benchmark
 from config import cfg
 
+# tracing/vtracer_wrapper.py (TAMBAHKAN INI)
+
 @benchmark
-def trace_image_to_svg(img_array: np.ndarray) -> str:
+def trace_image_to_svg(img_array: np.ndarray, custom_params: dict = None) -> str:
+    """
+    MODIFIED: Sekarang menerima custom_params dari adaptive tuner.
+    """
     log.info("Initiating VTracer vectorization engine...")
     
     temp_dir = cfg.CACHE_DIR
     temp_dir.mkdir(exist_ok=True)
     
-    # img_array sekarang datang sebagai RGB bersih dari geometry.py.
-    # Di sini kita konversi ke BGR agar siap ditulis oleh file saver.
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
     
     with tempfile.NamedTemporaryFile(dir=temp_dir, suffix=".png", delete=False) as temp_in:
@@ -27,45 +30,42 @@ def trace_image_to_svg(img_array: np.ndarray) -> str:
         output_path = temp_out.name
 
     try:
-        # BYPASS WINDOWS WRITE BUG
         _, encoded_img = cv2.imencode('.png', img_bgr)
         encoded_img.tofile(input_path)
         
         import time
-        time.sleep(0.1) # Tweak minor untuk IO lock window
+        time.sleep(0.1)
         
-       # Execute VTracer with production-grade parameters.
+        # GUNAKAN custom_params jika ada, otherwise pakai default
+        params = custom_params or {
+            "colormode": "color",
+            "hierarchical": "stacked",
+            "mode": "spline",
+            "filter_speckle": 4,
+            "color_precision": 6,
+            "layer_difference": 16,
+            "corner_threshold": 60,
+            "length_threshold": 4.5,
+            "max_iterations": 10,
+            "splice_threshold": 45,
+            "path_precision": 3
+        }
+        
         vtracer.convert_image_to_svg_py(
             input_path,
             output_path,
-            colormode="color",
-            hierarchical="stacked",
-            mode="spline",                  # Ganti kembali ke 'spline' untuk gambar organik
-            filter_speckle=4,               # Naikkan sedikit agar tidak melacak noise kecil
-            color_precision=6,              
-            layer_difference=16,
-            corner_threshold=60,            # Naikkan agar ujung daun membulat alami
-            length_threshold=4.0,                 
-            max_iterations=10,
-            splice_threshold=45,
-            path_precision=3                
+            **params  # Spread parameters
         )
         
         with open(output_path, 'r', encoding='utf-8') as f:
             svg_content = f.read()
-            
-        log.debug(f"Raw SVG tracing successful. Length: {len(svg_content)} chars.")
+        
         return svg_content
         
-    except Exception as e:
-        log.error(f"VTracer engine failed: {str(e)}")
-        raise
-        
     finally:
-        try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
-            if os.path.exists(output_path):
-                os.remove(output_path)
-        except OSError as cleanup_error:
-            log.warning(f"Failed to cleanup temp files: {cleanup_error}")
+        # Cleanup temp files
+        for path in [input_path, output_path]:
+            try:
+                os.unlink(path)
+            except:
+                pass
