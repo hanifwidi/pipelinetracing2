@@ -1,55 +1,54 @@
 # utils/adaptive_tuner.py
 import cv2
 import numpy as np
-from pathlib import Path
 from utils.logger import log
 from utils.benchmark import benchmark
 
 @benchmark
 def analyze_image_complexity(img_array: np.ndarray) -> dict:
     """
-    Analisis kompleksitas gambar untuk menentukan parameter VTracer yang optimal.
-    Returns: {color_count, edge_density, complexity_score}
+    FIX: quantize dulu ke 8 warna sebelum hitung, supaya JPEG compression
+    noise tidak dianggap "foto watercolor".
     """
     h, w = img_array.shape[:2]
-    
-    # 1. Hitung jumlah warna unik
-    pixels = img_array.reshape(-1, 3)
-    unique_colors = len(np.unique(pixels, axis=0))
-    
-    # 2. Hitung edge density (kepadatan garis)
+
+    # --- STEP 1: Hilangkan noise warna JPEG dengan quantize cepat ---
+    # Reshape + kuantisasi ke 16 level per channel (4096 bucket) cukup
+    # untuk membedakan warna solid dari noise kompresi.
+    quant = (img_array // 16) * 16
+    pixels_q = quant.reshape(-1, 3)
+    unique_colors = len(np.unique(pixels_q, axis=0))
+
+    # --- STEP 2: Edge density (tetap di gambar asli, tapi pakai threshold tinggi) ---
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
+    edges = cv2.Canny(gray, 100, 200)  # threshold tinggi = abaikan noise
     edge_density = np.count_nonzero(edges) / (h * w)
-    
-    # 3. Hitung variance warna (indikator gradient)
-    color_variance = np.std(pixels, axis=0).mean()
-    
-    # 4. Skor kompleksitas (0-100)
-    # Warna banyak + edge padat + variance tinggi = kompleks
-    complexity = min(100, (unique_colors * 0.3) + (edge_density * 500) + (color_variance * 0.5))
-    
+
+    # --- STEP 3: Color variance di gambar yang sudah di-quantize ---
+    color_variance = np.std(pixels_q, axis=0).mean()
+
+    # --- STEP 4: Skor kompleksitas baru ---
+    # Icon set solid: < 30 warna quantized, edge density rendah → SIMPLE
+    # Ilustrasi organik: > 60 warna, edge density tinggi → COMPLEX
+    complexity = min(100, (unique_colors * 1.5) + (edge_density * 800) + (color_variance * 0.3))
+
     result = {
         "color_count": unique_colors,
         "edge_density": edge_density,
         "color_variance": color_variance,
-        "complexity_score": complexity
+        "complexity_score": complexity,
     }
-    
-    log.info(f"Image analysis: {unique_colors} colors, edge density: {edge_density:.3f}, complexity: {complexity:.1f}/100")
+    log.info(f"Image analysis: {unique_colors} distinct colors (quantized), "
+             f"edge density: {edge_density:.3f}, complexity: {complexity:.1f}/100")
     return result
 
 
 def get_adaptive_vtracer_params(complexity_data: dict) -> dict:
-    """
-    Generate parameter VTracer berdasarkan analisis kompleksitas gambar.
-    """
     complexity = complexity_data["complexity_score"]
     color_count = complexity_data["color_count"]
-    
-    # Default parameters
+
     params = {
-        "color_mode": "color",
+        "colormode": "color",
         "hierarchical": "stacked",
         "mode": "spline",
         "filter_speckle": 4,
@@ -59,34 +58,26 @@ def get_adaptive_vtracer_params(complexity_data: dict) -> dict:
         "length_threshold": 4.5,
         "max_iterations": 10,
         "splice_threshold": 45,
-        "path_precision": 3
+        "path_precision": 3,
     }
-    
-    # ADAPTIVE TUNING LOGIC
-    
-    # Gambar simpel (logo, flat design, < 20 warna)
-    if complexity < 30 or color_count < 20:
-        params["filter_speckle"] = 2          # Kurangi filtering
-        params["corner_threshold"] = 60       # Pertahankan sudut tajam
-        params["length_threshold"] = 2.0      # Lebih detail
-        params["color_precision"] = 8         # Lebih presisi
-        log.info("Adaptive: Simple image detected (logo/flat design)")
-    
-    # Gambar medium (ilustrasi standar, 20-100 warna)
-    elif complexity < 70:
-        params["filter_speckle"] = 4
+
+    # Icon set solid (quantized < 30 colors, complexity < 35)
+    if complexity < 35 and color_count < 30:
+        params["filter_speckle"] = 2
         params["corner_threshold"] = 60
-        params["length_threshold"] = 4.5
-        params["color_precision"] = 6
+        params["length_threshold"] = 2.0
+        params["color_precision"] = 8
+        log.info("Adaptive: Simple image (solid icon set)")
+
+    elif complexity < 70:
         log.info("Adaptive: Medium complexity illustration")
-    
-    # Gambar kompleks (foto, cat air, > 100 warna, banyak gradient)
+
     else:
-        params["filter_speckle"] = 8          # Lebih agresif filter noise
-        params["corner_threshold"] = 50       # Lebih smooth curves
-        params["length_threshold"] = 6.0      # Kurangi detail kecil
-        params["color_precision"] = 4         # Toleransi warna lebih besar
-        params["layer_difference"] = 32       # Merge layer yang mirip
-        log.info("Adaptive: Complex image (photo/watercolor) - aggressive smoothing")
-    
+        params["filter_speckle"] = 8
+        params["corner_threshold"] = 50
+        params["length_threshold"] = 6.0
+        params["color_precision"] = 4
+        params["layer_difference"] = 32
+        log.info("Adaptive: Complex image (photo/watercolor)")
+
     return params
