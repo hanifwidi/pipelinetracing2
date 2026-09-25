@@ -36,6 +36,7 @@ with open(SCRAPE, newline='', encoding='utf-8') as f:
         if s['in_review'] != '1' and r.get('status') in ('', 'submitted'):
             r['status'] = 'accepted'
 
+LOG.parent.mkdir(parents=True, exist_ok=True)
 with open(LOG, 'w', newline='', encoding='utf-8') as f:
     w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows.values())
 print(f'Matched {matched} aset | {changed} perubahan download | log: {LOG}')

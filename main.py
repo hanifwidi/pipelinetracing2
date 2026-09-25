@@ -3,7 +3,8 @@ import shutil
 import argparse
 import sys
 import time
-import os                                          # ← FIX 1: import di top-level
+import os
+import re                                          # ← TAMBAH DI TOP
 import importlib
 from pathlib import Path
 from multiprocessing import Pool
@@ -15,10 +16,10 @@ from utils.filesystem import setup_directories, get_image_files
 from utils.quarantine import move_to_quarantine
 from utils.label_stripper import strip_captions
 
-# --- Preprocessing (nama fungsi sesuai main.py asli kamu) ---
+# --- Preprocessing ---
 from preprocess.resize import resize_image
 
-# --- Fitur baru (file buatan kita, nama pasti) ---
+# --- Fitur baru ---
 from utils.adaptive_tuner import analyze_image_complexity, get_adaptive_vtracer_params
 from utils.metadata_ai import generate_metadata
 from utils.metadata_injector import inject_svg_metadata, inject_eps_metadata
@@ -50,6 +51,21 @@ def _call(fn, variants):
 # ══════════════════════════════════════════════
 
 
+# ══════════ HARDENING FUNCTION (Adobe Stock compliance) ══════════
+def harden_for_adobe(svg_text: str) -> str:
+    """
+    Paksa SVG memenuhi standar Adobe Stock:
+    1. Dimensi intrinsik 5000px (preview jadi 25MP, aman dari flag <15MP)
+    2. Anti-aliasing hint (mengatasi "didn't use anti-aliasing")
+    """
+    svg_text = re.sub(r'(<svg[^>]*?)\swidth="[^"]*"',  r'\1 width="5000"',  svg_text, count=1)
+    svg_text = re.sub(r'(<svg[^>]*?)\sheight="[^"]*"', r'\1 height="5000"', svg_text, count=1)
+    if 'shape-rendering=' not in svg_text:
+        svg_text = svg_text.replace('<svg ', '<svg shape-rendering="geometricPrecision" ', 1)
+    return svg_text
+# ═════════════════════════════════════════════════════════════════
+
+
 def process_single_image(image_path: Path):
     try:
         log.info(f"Processing: {image_path.name}")
@@ -68,7 +84,7 @@ def process_single_image(image_path: Path):
         svg_content = _call(trace_fn, [(img_array, vparams), (img_array,)])
 
         # PHASE 4: SVG OPTIMIZATION (default OFF untuk isolasi bug)
-        if os.getenv("SKIP_OPT", "1") == "1":                       # ← FIX 4
+        if os.getenv("SKIP_OPT", "1") == "1":
             log.info("Phase 4: skipped (mode isolasi bug)")
         else:
             opt_fn = _fn("tracing.svg_optimizer", ["optimize_svg"])
@@ -94,6 +110,15 @@ def process_single_image(image_path: Path):
         log.info(f"SVG saved: {svg_out.name} ({svg_out.stat().st_size // 1024} KB)")
         inject_svg_metadata(svg_out, title, keywords)
 
+        # PHASE 6.5: HARDEN FOR ADOBE STOCK                          # ← TAMBAH DI SINI
+        try:
+            svg_text = svg_out.read_text(encoding="utf-8")
+            svg_text = harden_for_adobe(svg_text)
+            svg_out.write_text(svg_text, encoding="utf-8")
+            log.info(f"Hardened: {svg_out.name} (5000px + anti-aliasing)")
+        except Exception as e:
+            log.warning(f"Hardening failed: {svg_out.name}: {e}")
+
         # PHASE 7: EPS (optional)
         if cfg.EXPORT_EPS:
             eps_out = cfg.OUTPUT_EPS_FOLDER / f"{image_path.stem}.eps"
@@ -106,7 +131,7 @@ def process_single_image(image_path: Path):
         append_metadata_csv(cfg.OUTPUT_SVG_FOLDER / "metadata.csv",
                             f"{image_path.stem}.svg", title, keywords)
 
-        # PHASE 9: ARCHIVE PROCESSED INPUT                           # ← FIX 2
+        # PHASE 9: ARCHIVE PROCESSED INPUT
         if os.getenv("SKIP_ARCHIVE", "0") != "1":
             dest = cfg.INPUT_PROCESSED_FOLDER / image_path.name
             if dest.exists():
@@ -136,7 +161,7 @@ def main():
     if args.input: cfg.INPUT_FOLDER = Path(args.input)
     if args.workers: cfg.NUM_WORKERS = args.workers
     if args.eps: cfg.EXPORT_EPS = True
-    if args.no_archive: os.environ["SKIP_ARCHIVE"] = "1"            # ← FIX 3: di-set SEBELUM loop
+    if args.no_archive: os.environ["SKIP_ARCHIVE"] = "1"
 
     setup_directories()
     images = get_image_files(cfg.INPUT_FOLDER)
