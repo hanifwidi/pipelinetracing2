@@ -17,8 +17,10 @@ def setup_directories() -> None:
         cfg.OUTPUT_SVG_FOLDER,
         cfg.OUTPUT_EPS_FOLDER,
         cfg.LOG_DIR,
+        cfg.INPUT_PROCESSED_FOLDER,
         cfg.CACHE_DIR
     ]
+
     
     for directory in directories:
         try:

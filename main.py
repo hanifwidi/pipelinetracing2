@@ -1,7 +1,9 @@
 # main.py
+import shutil
 import argparse
 import sys
 import time
+import os                                          # ← FIX 1: import di top-level
 import importlib
 from pathlib import Path
 from multiprocessing import Pool
@@ -11,6 +13,7 @@ from config import cfg
 from utils.logger import log
 from utils.filesystem import setup_directories, get_image_files
 from utils.quarantine import move_to_quarantine
+from utils.label_stripper import strip_captions
 
 # --- Preprocessing (nama fungsi sesuai main.py asli kamu) ---
 from preprocess.resize import resize_image
@@ -24,13 +27,12 @@ from export.ghostscript_export import convert_svg_to_eps_ghostscript
 
 
 # ══════════ UNIVERSAL MODULE ADAPTER ══════════
-# Mendeteksi nama fungsi apa pun di dalam modul repo kamu.
 def _fn(mod_name, preferred):
     mod = importlib.import_module(mod_name)
     for n in preferred:
         if callable(getattr(mod, n, None)):
             return getattr(mod, n)
-    for n in dir(mod):  # fallback: fungsi publik pertama milik modul itu
+    for n in dir(mod):
         o = getattr(mod, n)
         if callable(o) and not n.startswith("_") and getattr(o, "__module__", "") == mod.__name__:
             return o
@@ -39,7 +41,7 @@ def _fn(mod_name, preferred):
 
 def _call(fn, variants):
     errs = []
-    for args in variants:  # coba beberapa varian tanda tangan
+    for args in variants:
         try:
             return fn(*args)
         except Exception as e:
@@ -53,20 +55,20 @@ def process_single_image(image_path: Path):
         log.info(f"Processing: {image_path.name}")
         start = time.time()
 
-        # PHASE 1: PREPROCESS (resize saja; filter lain opsional)
+        # PHASE 1: PREPROCESS
         img_array = resize_image(image_path)
+        img_array = strip_captions(img_array)
 
         # PHASE 2: ADAPTIVE TUNING
         complexity = analyze_image_complexity(img_array)
         vparams = get_adaptive_vtracer_params(complexity)
 
-        # PHASE 3: TRACING (adapter: pakai custom params kalau wrapper sudah di-update)
+        # PHASE 3: TRACING
         trace_fn = _fn("tracing.vtracer_wrapper", ["trace_image_to_svg"])
         svg_content = _call(trace_fn, [(img_array, vparams), (img_array,)])
 
-                # PHASE 4: SVG OPTIMIZATION (default OFF dulu untuk isolasi bug)
-        import os
-        if os.getenv("SKIP_OPT", "1") == "1":
+        # PHASE 4: SVG OPTIMIZATION (default OFF untuk isolasi bug)
+        if os.getenv("SKIP_OPT", "1") == "1":                       # ← FIX 4
             log.info("Phase 4: skipped (mode isolasi bug)")
         else:
             opt_fn = _fn("tracing.svg_optimizer", ["optimize_svg"])
@@ -77,10 +79,12 @@ def process_single_image(image_path: Path):
             if cfg.REMOVE_DUPLICATE_NODES:
                 dedup_fn = _fn("tracing.remove_duplicate_nodes", ["remove_duplicate_nodes"])
                 svg_content = _call(dedup_fn, [(svg_content,)])
+
         # PHASE 5: METADATA AI
         meta = generate_metadata(image_path)
         title, keywords = meta["title"], meta["keywords"]
-        # PHASE 6: EXPORT SVG (direct write — modul export asli minta file handle)
+
+        # PHASE 6: EXPORT SVG
         svg_out = cfg.OUTPUT_SVG_FOLDER / f"{image_path.stem}.svg"
         svg_out.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(svg_content, bytes):
@@ -90,7 +94,7 @@ def process_single_image(image_path: Path):
         log.info(f"SVG saved: {svg_out.name} ({svg_out.stat().st_size // 1024} KB)")
         inject_svg_metadata(svg_out, title, keywords)
 
-        # PHASE 7: EPS (Ghostscript dulu, fallback Inkscape modul aslimu)
+        # PHASE 7: EPS (optional)
         if cfg.EXPORT_EPS:
             eps_out = cfg.OUTPUT_EPS_FOLDER / f"{image_path.stem}.eps"
             if not convert_svg_to_eps_ghostscript(svg_out, eps_out):
@@ -101,6 +105,17 @@ def process_single_image(image_path: Path):
         # PHASE 8: CSV BACKUP
         append_metadata_csv(cfg.OUTPUT_SVG_FOLDER / "metadata.csv",
                             f"{image_path.stem}.svg", title, keywords)
+
+        # PHASE 9: ARCHIVE PROCESSED INPUT                           # ← FIX 2
+        if os.getenv("SKIP_ARCHIVE", "0") != "1":
+            dest = cfg.INPUT_PROCESSED_FOLDER / image_path.name
+            if dest.exists():
+                stem = image_path.stem
+                suffix = image_path.suffix
+                ts = int(time.time())
+                dest = cfg.INPUT_PROCESSED_FOLDER / f"{stem}_{ts}{suffix}"
+            shutil.move(str(image_path), str(dest))
+            log.info(f"Archived: {image_path.name} → input_processed/")
 
         log.info(f"✅ Completed: {image_path.name} in {time.time()-start:.2f}s")
 
@@ -114,11 +129,14 @@ def main():
     ap.add_argument("--input", type=str)
     ap.add_argument("--workers", type=int)
     ap.add_argument("--eps", action="store_true")
+    ap.add_argument("--no-archive", action="store_true",
+                    help="Keep processed inputs in input/ folder")
     args = ap.parse_args()
 
     if args.input: cfg.INPUT_FOLDER = Path(args.input)
     if args.workers: cfg.NUM_WORKERS = args.workers
     if args.eps: cfg.EXPORT_EPS = True
+    if args.no_archive: os.environ["SKIP_ARCHIVE"] = "1"            # ← FIX 3: di-set SEBELUM loop
 
     setup_directories()
     images = get_image_files(cfg.INPUT_FOLDER)

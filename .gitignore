@@ -7,3 +7,10 @@ output_svg/
 output_eps/
 logs/
 .DS_Store
+__pycache__/
+*.pyc
+adobe_scrape_*.csv
+input_processed/
+output/
+*.sublime-workspace
+tracking/production_log.csv

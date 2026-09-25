@@ -7,7 +7,7 @@ from utils.metadata_ai import generate_metadata, _image_hash
 from utils.metadata_injector import inject_svg_metadata
 
 setup_directories()
-images = get_image_files(cfg.INPUT_FOLDER)
+images = get_image_files(cfg.INPUT_FOLDER) + get_image_files(cfg.INPUT_PROCESSED_FOLDER)
 log.info(f"REPAIR MODE: {len(images)} images (cache hit = instan, tanpa API)")
 
 for img in images:

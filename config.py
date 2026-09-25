@@ -13,6 +13,7 @@ class VectorFactoryConfig:
     
     # Project Structure Paths
     INPUT_FOLDER: Path = Path("input")
+    INPUT_PROCESSED_FOLDER: Path = Path("input_processed")
     OUTPUT_SVG_FOLDER: Path = Path("output_svg")
     OUTPUT_EPS_FOLDER: Path = Path("output_eps")
     LOG_DIR: Path = Path("logs")
