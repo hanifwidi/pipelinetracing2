@@ -1,67 +1,59 @@
-# config.py
+"""Runtime defaults. CLI options override these values before workers start."""
 import multiprocessing
-from pathlib import Path
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List
 
 @dataclass
 class VectorFactoryConfig:
-    """
-    Central configuration state for the Vector Factory V2 Pipeline.
-    All parameters are strictly typed and can be overridden via CLI.
-    """
-    
-    # Project Structure Paths
     INPUT_FOLDER: Path = Path("input")
     INPUT_PROCESSED_FOLDER: Path = Path("input_processed")
     OUTPUT_SVG_FOLDER: Path = Path("output_svg")
     OUTPUT_EPS_FOLDER: Path = Path("output_eps")
+    PREVIEW_FOLDER: Path = Path("previews")
+    TRACKING_FOLDER: Path = Path("tracking")
+    QUARANTINE_FOLDER: Path = Path("quarantine")
     LOG_DIR: Path = Path("logs")
     CACHE_DIR: Path = Path("cache")
-    
-    # System & Multiprocessing
     USE_MULTIPROCESS: bool = True
-    NUM_WORKERS: int = multiprocessing.cpu_count()
+    NUM_WORKERS: int = min(4, max(1, multiprocessing.cpu_count() - 1))
+    METADATA_WORKERS: int = 2
+    AI_REQUESTS_PER_MINUTE: int = 10
+    AI_TIMEOUT: int = 30
+    AI_RETRIES: int = 2
     DEBUG_MODE: bool = False
-    
-    # Step 2: Resize Parameters
     MAX_SIZE: int = 2048
-    
-    # Step 3: Adaptive Color Quantization
-    QUANTIZATION_METHOD: str = "kmeans"  # Options: kmeans, median_cut, octree
-    NUM_COLORS: int = 8  # Supported: 4, 6, 8, 12, 16, 32
-    
-    # Step 4: Noise Reduction Parameters
+    STRIP_CAPTIONS: bool = False
+    GRID_ROWS: int = 4
+    GRID_COLS: int = 4
+    TARGET_MEGAPIXELS: float = 25.0
+    MIN_MEGAPIXELS: float = 15.0
+    MAX_MEGAPIXELS: float = 65.0
+    MAX_FILE_MB: float = 45.0
+    PREVIEW_WIDTH: int = 1024
+    MAX_VISUAL_MAE: float = 0.10
+    MAX_BBOX_DRIFT: float = 0.05
+    OPTIMIZE_SVG: bool = True
+    SVG_PRECISION: int = 3
+    MERGE_ADJACENT_PATHS: bool = False
+    REMOVE_DUPLICATE_NODES: bool = True
+    EXPORT_EPS: bool = False
+    INKSCAPE_PATH: str = "inkscape"
+    # Retained for optional preprocessing modules, not all enabled in main.py.
+    QUANTIZATION_METHOD: str = "kmeans"
+    NUM_COLORS: int = 8
     DENOISE_KERNEL_SIZE: int = 5
     ENABLE_MORPHOLOGY: bool = True
-    
-    # Step 5: Text Removal (OCR)
     REMOVE_TEXT: bool = False
-    OCR_LANGUAGES: List[str] = field(default_factory=lambda: ['en'])
-    
-    # Step 6 & 7: Clean Up & Connected Components
+    OCR_LANGUAGES: List[str] = field(default_factory=lambda: ["en"])
     REMOVE_TINY_OBJECTS: bool = True
-    MIN_COMPONENT_AREA: int = 25  # Minimum pixel area to retain
-    
-    # Step 8 & 9: Contour & Geometry Simplification
+    MIN_COMPONENT_AREA: int = 25
     GEOMETRY_SIMPLIFICATION: str = "douglas_peucker"
     EPSILON_FACTOR: float = 0.002
-    
-    # Step 10: VTracer Auto-Tuning Defaults (will be dynamically adjusted)
-    TRACE_MODE: str = "spline"  # Options: spline, polygon
+    TRACE_MODE: str = "spline"
     VTRACER_COLOR_PRECISION: int = 6
     VTRACER_CORNER_THRESHOLD: int = 60
     VTRACER_SPECKLE_FILTERING: int = 4
     VTRACER_LAYER_DIFFERENCE: int = 16
-    
-    # Step 11 & 12: SVG Geometry Optimization
-    SVG_PRECISION: int = 3
-    MERGE_ADJACENT_PATHS: bool = True
-    REMOVE_DUPLICATE_NODES: bool = True
-    
-    # Step 13: Export Pipeline
-    EXPORT_EPS: bool = False
-    INKSCAPE_PATH: str = "inkscape"  # Assumes inkscape is available in system PATH
 
-# Instantiate global configuration state
 cfg = VectorFactoryConfig()

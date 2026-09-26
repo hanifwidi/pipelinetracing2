@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
-"""Niche performance tracker - verdict DOUBLE-DOWN / HOLD / KILL"""
-import csv, sys
-from datetime import date, datetime
+"""Report actual downloads and observed demand; no earnings forecast."""
+import argparse
+import json
+from datetime import date
 from pathlib import Path
+from utils.tracking import build_report
 
-LOG = Path("tracking/production_log.csv")
-
-def cmd_report():
-    if not LOG.exists():
-        print(f"❌ {LOG} belum ada. Jalankan dulu: python init_tracking.py"); return
-    rows = list(csv.DictReader(open(LOG, newline='', encoding='utf-8')))
-    agg = {}
-    for r in rows:
-        a = agg.setdefault(r['niche'], dict(sub=0, acc=0, rej=0, pend=0, dl=0))
-        a['sub'] += 1
-        if r['status'] == 'accepted': a['acc'] += 1
-        elif r['status'] == 'rejected': a['rej'] += 1
-        else: a['pend'] += 1
-        a['dl'] += max([int(r.get(c) or 0) for c in ('dl_30d','dl_60d','dl_90d')])
-    print(f"\n{'NICHE':<14}{'SUB':>4}{'ACC':>4}{'REJ':>4}{'PEND':>5}{'RATE':>7}{'DL':>5}  VERDICT")
-    for k, a in sorted(agg.items()):
-        decided = a['acc'] + a['rej']
-        rate = f"{a['acc']/decided*100:.0f}%" if decided else '-'
-        verdict = '-'
-        if decided >= 5:
-            ratio = a['acc'] / decided
-            verdict = 'DOUBLE-DOWN 🔥' if ratio >= 0.7 else 'KILL 💀' if ratio < 0.4 else 'HOLD ⏸'
-        print(f"{k:<14}{a['sub']:>4}{a['acc']:>4}{a['rej']:>4}{a['pend']:>5}{rate:>7}{a['dl']:>5}  {verdict}")
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("command", nargs="?", choices=["report"], default="report")
+    ap.add_argument("--log", type=Path, default=Path("tracking/production_log.csv"))
+    ap.add_argument("--as-of", type=date.fromisoformat)
+    ap.add_argument("--min-assets", type=int, default=10)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    if args.min_assets < 1:
+        ap.error("--min-assets must be positive")
+    if not args.log.exists():
+        ap.error("Production log not found; run init_tracking.py first")
+    report = build_report(args.log, args.as_of, args.min_assets)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"{'NICHE':<18}{'ASSETS':>7}{'ACC':>6}{'REJ':>6}{'DL':>8}{'DL/ASSET/30D':>15}{'USD*':>10}  VERDICT")
+        for niche, row in sorted(report.items()):
+            recent = row['downloads_per_observed_asset_30d']
+            rate = '-' if recent is None else f"{recent:.2f}"
+            royalty = '-' if not row['royalty_known'] else f"{row['royalty_usd']:.2f}"
+            print(f"{niche:<18}{row['assets']:>7}{row['accepted']:>6}{row['rejected']:>6}{row['downloads']:>8}{rate:>15}{royalty:>10}  {row['verdict']}")
+        print("* USD includes reported royalties only. 30-day rates require dated observations; EXPAND TEST is a heuristic.")
+    return 0
 
 if __name__ == "__main__":
-    c = sys.argv[1] if len(sys.argv) > 1 else "report"
-    if c == "report": cmd_report()
+    raise SystemExit(main())

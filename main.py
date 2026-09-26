@@ -1,188 +1,310 @@
-# main.py
-import shutil
+"""Image-to-vector production pipeline with explicit stages and resumable tracing."""
 import argparse
+import csv
+import hashlib
+import importlib.metadata
+import json
+import multiprocessing
+import os
+import re
+import shutil
 import sys
 import time
-import os
-import re                                          # ← TAMBAH DI TOP
-import importlib
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from pathlib import Path
-from multiprocessing import Pool
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, BarColumn, TextColumn
 
+import cv2
+from filelock import FileLock, Timeout
+from PIL import Image
+from rich.progress import Progress
 from config import cfg
-from utils.logger import log
-from utils.filesystem import setup_directories, get_image_files
-from utils.quarantine import move_to_quarantine
-from utils.label_stripper import strip_captions
-
-# --- Preprocessing ---
+from export.eps_export import convert_svg_to_eps, find_inkscape
+from export.svg_export import save_svg
 from preprocess.resize import resize_image
-
-# --- Fitur baru ---
+from tracing.vtracer_wrapper import trace_image_to_svg
+from tracing.svg_optimizer import optimize_svg_tree
+from tracing.merge_paths import merge_same_color_paths
+from tracing.remove_duplicate_nodes import clean_duplicate_nodes
 from utils.adaptive_tuner import analyze_image_complexity, get_adaptive_vtracer_params
-from utils.metadata_ai import generate_metadata
+from utils.atomic_io import atomic_write, read_json, write_json
+from utils.csv_exporter import append_metadata_csv, remove_metadata_row
+from utils.filesystem import setup_directories, get_image_files
+from utils.label_stripper import strip_captions
+from utils.logger import log
+from utils.metadata_ai import generate_metadata, _clean_metadata
 from utils.metadata_injector import inject_svg_metadata, inject_eps_metadata
-from utils.csv_exporter import append_metadata_csv
-from export.ghostscript_export import convert_svg_to_eps_ghostscript
+from utils.quality import inspect_svg, render_preview
+from utils.quarantine import move_to_quarantine
+from utils.svg_tools import harden_for_adobe, parse_svg
+from utils.tracking import record_asset
+
+PIPELINE_VERSION = "3.0"
 
 
-# ══════════ UNIVERSAL MODULE ADAPTER ══════════
-def _fn(mod_name, preferred):
-    mod = importlib.import_module(mod_name)
-    for n in preferred:
-        if callable(getattr(mod, n, None)):
-            return getattr(mod, n)
-    for n in dir(mod):
-        o = getattr(mod, n)
-        if callable(o) and not n.startswith("_") and getattr(o, "__module__", "") == mod.__name__:
-            return o
-    raise ImportError(f"Tidak ada callable di {mod_name}")
+def content_hash(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024*1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _call(fn, variants):
-    errs = []
-    for args in variants:
+def tracing_signature():
+    names = ["MAX_SIZE", "STRIP_CAPTIONS", "GRID_ROWS", "GRID_COLS", "OPTIMIZE_SVG", "SVG_PRECISION", "MERGE_ADJACENT_PATHS", "REMOVE_DUPLICATE_NODES", "TARGET_MEGAPIXELS"]
+    values = {key: getattr(cfg, key) for key in names}
+    values.update(version=PIPELINE_VERSION, vtracer=importlib.metadata.version("vtracer"))
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def initialize_worker(settings):
+    # Explicit transfer also works with the spawn start method on macOS/Windows.
+    cfg.__dict__.update(settings)
+    cv2.setNumThreads(1)
+    os.environ.setdefault("RAYON_NUM_THREADS", "1")
+
+
+def process_single_image(job):
+    start = time.monotonic()
+    path = Path(job["sources"][0])
+    folder = cfg.CACHE_DIR / "tracing" / job["asset_id"] / job["signature"]
+    folder.mkdir(parents=True, exist_ok=True)
+    reference, raw_svg = folder / "reference.png", folder / "raw.svg"
+    cache_hit = raw_svg.exists() and reference.exists() and not job.get("force")
+    if cache_hit:
         try:
-            return fn(*args)
-        except Exception as e:
-            errs.append(e)
-    raise RuntimeError(f"Semua varian pemanggilan {fn.__name__} gagal: {errs[-1]}")
-# ══════════════════════════════════════════════
+            parse_svg(raw_svg.read_bytes())
+            with Image.open(reference) as im:
+                im.verify()
+        except Exception as exc:
+            log.warning("Rebuilding invalid trace cache: %s", type(exc).__name__)
+            cache_hit = False
+    if not cache_hit:
+        image = resize_image(path, cfg.MAX_SIZE)
+        if cfg.STRIP_CAPTIONS:
+            if image.shape[0] < cfg.GRID_ROWS or image.shape[1] < cfg.GRID_COLS:
+                raise ValueError("Caption grid exceeds image dimensions")
+            image = strip_captions(image, cfg.GRID_ROWS, cfg.GRID_COLS)
+        params = get_adaptive_vtracer_params(analyze_image_complexity(image))
+        svg = trace_image_to_svg(image, params)
+        Image.fromarray(image).save(reference)
+        atomic_write(raw_svg, svg)
+    svg = raw_svg.read_text(encoding="utf-8")
+    if cfg.OPTIMIZE_SVG:
+        svg = optimize_svg_tree(svg)
+        svg = merge_same_color_paths(svg)
+        svg = clean_duplicate_nodes(svg)
+    svg = harden_for_adobe(svg)
+    svg_path = cfg.OUTPUT_SVG_FOLDER / (job["basename"] + ".svg")
+    save_svg(svg, path.name, svg_path)
+    preview = cfg.PREVIEW_FOLDER / (job["basename"] + ".png")
+    render_preview(svg_path, preview)
+    quality = inspect_svg(svg_path, preview, reference)
+    eps_path = None
+    if cfg.EXPORT_EPS:
+        eps_path = cfg.OUTPUT_EPS_FOLDER / (job["basename"] + ".eps")
+        if not convert_svg_to_eps(svg_path, eps_path):
+            raise RuntimeError("EPS export/validation failed")
+    result = {**job, "svg": str(svg_path.resolve()), "eps": str(eps_path.resolve()) if eps_path else None,
+              "preview": str(preview.resolve()), "reference": str(reference.resolve()), "quality": quality,
+              "trace_cache_hit": cache_hit, "production_seconds": round(time.monotonic()-start, 3)}
+    write_json(cfg.PREVIEW_FOLDER / (job["basename"] + ".qa.json"), quality)
+    return result
 
 
-# ══════════ HARDENING FUNCTION (Adobe Stock compliance) ══════════
-def harden_for_adobe(svg_text: str) -> str:
-    """
-    Paksa SVG memenuhi standar Adobe Stock:
-    1. Dimensi intrinsik 5000px (preview jadi 25MP, aman dari flag <15MP)
-    2. Anti-aliasing hint (mengatasi "didn't use anti-aliasing")
-    """
-    svg_text = re.sub(r'(<svg[^>]*?)\swidth="[^"]*"',  r'\1 width="5000"',  svg_text, count=1)
-    svg_text = re.sub(r'(<svg[^>]*?)\sheight="[^"]*"', r'\1 height="5000"', svg_text, count=1)
-    if 'shape-rendering=' not in svg_text:
-        svg_text = svg_text.replace('<svg ', '<svg shape-rendering="geometricPrecision" ', 1)
-    return svg_text
-# ═════════════════════════════════════════════════════════════════
+def _load_manual(path):
+    if not path:
+        return {}
+    with Path(path).open(newline="", encoding="utf-8-sig") as stream:
+        rows = list(csv.DictReader(stream))
+    result = {}
+    for row in rows:
+        key = row["Filename"]
+        if key in result:
+            raise ValueError(f"Duplicate metadata filename: {key}")
+        result[key] = {**_clean_metadata({"title": row["Title"], "keywords": [v.strip() for v in row["Keywords"].split(",")]}), "source": "manual", "category": row.get("Category", "")}
+    return result
 
 
-def process_single_image(image_path: Path):
-    try:
-        log.info(f"Processing: {image_path.name}")
-        start = time.time()
+def _metadata(stage, manual, force):
+    keys = [Path(stage["svg"]).name]
+    if stage.get("unique_source_name"):
+        keys += [Path(stage["sources"][0]).name]
+    for key in keys:
+        if key in manual:
+            return manual[key]
+    return generate_metadata(Path(stage["preview"]), force=force, filename=Path(stage["sources"][0]).stem)
 
-        # PHASE 1: PREPROCESS
-        img_array = resize_image(image_path)
-        img_array = strip_captions(img_array)
 
-        # PHASE 2: ADAPTIVE TUNING
-        complexity = analyze_image_complexity(img_array)
-        vparams = get_adaptive_vtracer_params(complexity)
-
-        # PHASE 3: TRACING
-        trace_fn = _fn("tracing.vtracer_wrapper", ["trace_image_to_svg"])
-        svg_content = _call(trace_fn, [(img_array, vparams), (img_array,)])
-
-        # PHASE 4: SVG OPTIMIZATION (default OFF untuk isolasi bug)
-        if os.getenv("SKIP_OPT", "1") == "1":
-            log.info("Phase 4: skipped (mode isolasi bug)")
+def _archive(sources, asset_id):
+    archived = []
+    for source in map(Path, sources):
+        target = cfg.INPUT_PROCESSED_FOLDER / f"{source.stem}__{asset_id[:12]}{source.suffix}"
+        if target.exists():
+            if content_hash(target) != asset_id:
+                target = cfg.INPUT_PROCESSED_FOLDER / f"{source.stem}__{asset_id}{source.suffix}"
+                if target.exists() and content_hash(target) != asset_id:
+                    raise FileExistsError(target)
+            if target.exists():
+                source.unlink()
+            else:
+                shutil.move(str(source), str(target))
         else:
-            opt_fn = _fn("tracing.svg_optimizer", ["optimize_svg"])
-            svg_content = _call(opt_fn, [(svg_content,), (svg_content, cfg.SVG_PRECISION)])
-            if cfg.MERGE_ADJACENT_PATHS:
-                merge_fn = _fn("tracing.merge_paths", ["merge_adjacent_paths"])
-                svg_content = _call(merge_fn, [(svg_content,)])
-            if cfg.REMOVE_DUPLICATE_NODES:
-                dedup_fn = _fn("tracing.remove_duplicate_nodes", ["remove_duplicate_nodes"])
-                svg_content = _call(dedup_fn, [(svg_content,)])
+            shutil.move(str(source), str(target))
+        archived.append(str(target.resolve()))
+    return archived
 
-        # PHASE 5: METADATA AI
-        meta = generate_metadata(image_path)
-        title, keywords = meta["title"], meta["keywords"]
 
-        # PHASE 6: EXPORT SVG
-        svg_out = cfg.OUTPUT_SVG_FOLDER / f"{image_path.stem}.svg"
-        svg_out.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(svg_content, bytes):
-            svg_out.write_bytes(svg_content)
+def finalize(stage, meta, no_archive):
+    svg = Path(stage["svg"])
+    valid_meta = meta.get("source") in {"ai", "manual"}
+    status = "needs_metadata" if not valid_meta else "ready" if stage["quality"]["passed"] else "needs_review"
+    if valid_meta:
+        clean = _clean_metadata(meta)
+        inject_svg_metadata(svg, clean["title"], clean["keywords"])
+        if stage.get("eps"):
+            stage["eps_metadata_embedded"] = inject_eps_metadata(Path(stage["eps"]), clean["title"], clean["keywords"])
+    if svg.stat().st_size > cfg.MAX_FILE_MB * 1_000_000 or (stage.get("eps") and Path(stage["eps"]).stat().st_size > cfg.MAX_FILE_MB * 1_000_000):
+        raise ValueError("Final file exceeds the size limit after metadata injection")
+    stage.update(status=status, metadata=meta)
+    for folder, extension in [(cfg.OUTPUT_SVG_FOLDER, ".svg"), (cfg.OUTPUT_EPS_FOLDER, ".eps")]:
+        if extension == ".eps" and not stage.get("eps"):
+            continue
+        name = stage["basename"] + extension
+        if status == "ready":
+            append_metadata_csv(folder / "metadata.csv", name, meta["title"], meta["keywords"], meta.get("category", ""))
+            remove_metadata_row(folder / "review.csv", name)
         else:
-            svg_out.write_text(svg_content, encoding="utf-8")
-        log.info(f"SVG saved: {svg_out.name} ({svg_out.stat().st_size // 1024} KB)")
-        inject_svg_metadata(svg_out, title, keywords)
-
-        # PHASE 6.5: HARDEN FOR ADOBE STOCK                          # ← TAMBAH DI SINI
-        try:
-            svg_text = svg_out.read_text(encoding="utf-8")
-            svg_text = harden_for_adobe(svg_text)
-            svg_out.write_text(svg_text, encoding="utf-8")
-            log.info(f"Hardened: {svg_out.name} (5000px + anti-aliasing)")
-        except Exception as e:
-            log.warning(f"Hardening failed: {svg_out.name}: {e}")
-
-        # PHASE 7: EPS (optional)
-        if cfg.EXPORT_EPS:
-            eps_out = cfg.OUTPUT_EPS_FOLDER / f"{image_path.stem}.eps"
-            if not convert_svg_to_eps_ghostscript(svg_out, eps_out):
-                eps_fn = _fn("export.eps_export", ["export_eps", "convert_svg_to_eps", "svg_to_eps"])
-                _call(eps_fn, [(svg_out, eps_out), (str(svg_out), str(eps_out))])
-            inject_eps_metadata(eps_out, title, keywords)
-
-        # PHASE 8: CSV BACKUP
-        append_metadata_csv(cfg.OUTPUT_SVG_FOLDER / "metadata.csv",
-                            f"{image_path.stem}.svg", title, keywords)
-
-        # PHASE 9: ARCHIVE PROCESSED INPUT
-        if os.getenv("SKIP_ARCHIVE", "0") != "1":
-            dest = cfg.INPUT_PROCESSED_FOLDER / image_path.name
-            if dest.exists():
-                stem = image_path.stem
-                suffix = image_path.suffix
-                ts = int(time.time())
-                dest = cfg.INPUT_PROCESSED_FOLDER / f"{stem}_{ts}{suffix}"
-            shutil.move(str(image_path), str(dest))
-            log.info(f"Archived: {image_path.name} → input_processed/")
-
-        log.info(f"✅ Completed: {image_path.name} in {time.time()-start:.2f}s")
-
-    except Exception as e:
-        log.error(f"❌ Failed: {image_path.name}: {e}")
-        move_to_quarantine(image_path, str(e))
+            append_metadata_csv(folder / "review.csv", name, meta["title"], meta.get("keywords", []), meta.get("category", ""))
+            remove_metadata_row(folder / "metadata.csv", name)
+    record_asset(cfg.TRACKING_FOLDER / "production_log.csv", svg.name,
+                 {"asset_id": stage["asset_id"], "pipeline_status": status, "production_seconds": stage["production_seconds"]})
+    if status == "ready" and not no_archive:
+        stage["sources"] = _archive(stage["sources"], stage["asset_id"])
+    return stage
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", type=str)
-    ap.add_argument("--workers", type=int)
-    ap.add_argument("--eps", action="store_true")
-    ap.add_argument("--no-archive", action="store_true",
-                    help="Keep processed inputs in input/ folder")
-    args = ap.parse_args()
-
-    if args.input: cfg.INPUT_FOLDER = Path(args.input)
-    if args.workers: cfg.NUM_WORKERS = args.workers
-    if args.eps: cfg.EXPORT_EPS = True
-    if args.no_archive: os.environ["SKIP_ARCHIVE"] = "1"
-
+def run_pipeline(args):
     setup_directories()
+    find_inkscape()  # Fail before processing inputs if previews cannot be rendered.
+    manual = _load_manual(args.metadata_csv)
+    manifest_path = cfg.TRACKING_FOLDER / "pipeline_manifest.json"
+    manifest = read_json(manifest_path, {"version": PIPELINE_VERSION, "assets": {}})
     images = get_image_files(cfg.INPUT_FOLDER)
     if not images:
-        log.error(f"No images in {cfg.INPUT_FOLDER}"); sys.exit(1)
+        log.info("No pending images in %s", cfg.INPUT_FOLDER)
+        return 0
+    jobs = {}
+    name_counts = Counter(p.name for p in images)
+    for image in images:
+        digest = content_hash(image)
+        if digest in jobs:
+            jobs[digest]["sources"].append(str(image)); continue
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", image.stem).strip("_")[:100] or "asset"
+        saved = manifest["assets"].get(digest, {})
+        jobs[digest] = {"asset_id": digest, "basename": saved.get("basename", f"{stem}__{digest[:12]}"),
+                       "sources": [str(image)], "signature": tracing_signature(), "force": args.force,
+                       "unique_source_name": name_counts[image.name] == 1}
+    settings = asdict(cfg)
+    initialize_worker(settings)
+    failures = 0
+    states = Counter()
 
-    log.info(f"Found {len(images)} images | workers: {cfg.NUM_WORKERS}")
+    def store(stage):
+        manifest["assets"][stage["asset_id"]] = stage
+        write_json(manifest_path, manifest)
 
-    if cfg.USE_MULTIPROCESS and cfg.NUM_WORKERS > 1:
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                      BarColumn(), TimeElapsedColumn()) as progress:
-            task = progress.add_task("Tracing...", total=len(images))
-            with Pool(cfg.NUM_WORKERS) as pool:
-                for _ in pool.imap_unordered(process_single_image, images):
-                    progress.update(task, advance=1)
-    else:
-        for img in images:
-            process_single_image(img)
+    def fail(job, exc):
+        nonlocal failures
+        failures += 1
+        failed = {**job, "status": "failed", "error": str(exc)}
+        # A failed rerun must not leave a stale upload-ready CSV row.
+        remove_metadata_row(cfg.OUTPUT_SVG_FOLDER / "metadata.csv", job["basename"] + ".svg")
+        remove_metadata_row(cfg.OUTPUT_EPS_FOLDER / "metadata.csv", job["basename"] + ".eps")
+        store(failed)
+        log.error("Failed %s: %s", job["basename"], exc)
+        for source in job["sources"]:
+            if Path(source).exists():
+                move_to_quarantine(Path(source), str(exc))
 
-    log.info("🎉 Pipeline completed")
+    with ThreadPoolExecutor(max_workers=cfg.METADATA_WORKERS) as metadata_pool, Progress() as progress:
+        task = progress.add_task("Tracing / metadata / validation", total=len(jobs))
+        pending = {}
+        def enqueue(stage):
+            pending[metadata_pool.submit(_metadata, stage, manual, args.force_metadata)] = stage
+        if cfg.USE_MULTIPROCESS and cfg.NUM_WORKERS > 1:
+            with ProcessPoolExecutor(max_workers=min(cfg.NUM_WORKERS, len(jobs)), mp_context=multiprocessing.get_context("spawn"), initializer=initialize_worker, initargs=(settings,)) as pool:
+                futures = {pool.submit(process_single_image, job): job for job in jobs.values()}
+                for future in as_completed(futures):
+                    try:
+                        enqueue(future.result())
+                    except Exception as exc:
+                        fail(futures[future], exc); progress.advance(task)
+        else:
+            for job in jobs.values():
+                try:
+                    enqueue(process_single_image(job))
+                except Exception as exc:
+                    fail(job, exc); progress.advance(task)
+        for future in as_completed(pending):
+            stage = pending[future]
+            try:
+                stage = finalize(stage, future.result(), args.no_archive)
+                states[stage["status"]] += 1
+                store(stage)
+            except Exception as exc:
+                fail(stage, exc)
+            progress.advance(task)
+    log.info("Finished | ready=%d | needs_metadata=%d | needs_review=%d | failed=%d", states['ready'], states['needs_metadata'], states['needs_review'], failures)
+    return 1 if failures else 0
 
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--input", type=Path)
+    ap.add_argument("--workers", type=int, default=cfg.NUM_WORKERS)
+    ap.add_argument("--metadata-workers", type=int, default=cfg.METADATA_WORKERS)
+    ap.add_argument("--ai-rpm", type=int, default=cfg.AI_REQUESTS_PER_MINUTE)
+    ap.add_argument("--eps", action="store_true")
+    ap.add_argument("--no-archive", action="store_true", default=os.getenv("SKIP_ARCHIVE") == "1")
+    ap.add_argument("--skip-opt", action="store_true", default=os.getenv("SKIP_OPT") == "1")
+    ap.add_argument("--strip-captions", action="store_true")
+    ap.add_argument("--grid", default="4x4", help="Caption grid, e.g. 4x4 or 3x5")
+    ap.add_argument("--target-mp", type=float, default=cfg.TARGET_MEGAPIXELS)
+    ap.add_argument("--max-size", type=int, default=cfg.MAX_SIZE)
+    ap.add_argument("--metadata-csv", type=Path, help="Reviewed metadata; bypass AI for matching filenames")
+    ap.add_argument("--force", action="store_true", help="Rebuild tracing cache")
+    ap.add_argument("--force-metadata", action="store_true", help="Regenerate cached AI metadata")
+    args = ap.parse_args(argv)
+    if min(args.workers, args.metadata_workers, args.ai_rpm, args.max_size) < 1:
+        ap.error("Workers, rate limit, and maximum image size must be positive")
+    try:
+        rows, cols = map(int, args.grid.lower().split("x"))
+        if min(rows, cols) < 1:
+            raise ValueError()
+    except ValueError:
+        ap.error("--grid must have positive rows x columns, e.g. 4x4")
+    if not cfg.MIN_MEGAPIXELS <= args.target_mp <= cfg.MAX_MEGAPIXELS:
+        ap.error("--target-mp must be between 15 and 65")
+    if args.input:
+        cfg.INPUT_FOLDER = args.input
+    cfg.NUM_WORKERS, cfg.METADATA_WORKERS = args.workers, args.metadata_workers
+    cfg.AI_REQUESTS_PER_MINUTE = args.ai_rpm
+    cfg.EXPORT_EPS = args.eps
+    cfg.OPTIMIZE_SVG = not args.skip_opt
+    cfg.STRIP_CAPTIONS, cfg.GRID_ROWS, cfg.GRID_COLS = args.strip_captions, rows, cols
+    cfg.TARGET_MEGAPIXELS, cfg.MAX_SIZE = args.target_mp, args.max_size
+    cfg.TRACKING_FOLDER.mkdir(parents=True, exist_ok=True)
+    try:
+        with FileLock(str(cfg.TRACKING_FOLDER / "pipeline.lock"), timeout=0):
+            return run_pipeline(args)
+    except Timeout:
+        log.error("Another pipeline or metadata repair is using this workspace")
+        return 1
+    except Exception as exc:
+        log.error("Pipeline stopped: %s", exc)
+        return 1
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,74 +1,58 @@
-# tracing/merge_paths.py
-from lxml import etree
-from collections import defaultdict
-from utils.logger import log
-from utils.benchmark import benchmark
-from config import cfg
+"""Merge only adjacent, identically styled, provably disjoint simple paths.
 
-@benchmark
-def merge_same_color_paths(tree: etree._ElementTree) -> etree._ElementTree:
-    """
-    Scans the SVG document for paths sharing the exact same fill color and 
-    concatenates their geometry data ('d' attributes) into a single compound path.
-    This drastically reduces DOM size and improves editability in Adobe Illustrator.
-    
-    Args:
-        tree (etree._ElementTree): The parsed SVG XML tree.
-        
-    Returns:
-        etree._ElementTree: The optimized tree with merged paths.
-    """
+Other paths are deliberately retained. Bounding boxes include Bezier control
+points, giving conservative bounds; relative commands and arcs are not merged.
+"""
+from config import cfg
+from utils.svg_tools import SVG_NS, parse_svg, path_tokens
+
+def _bounds(d):
+    tokens = path_tokens(d)
+    if not tokens or tokens[0] != "M":
+        return None
+    points = []
+    i = 0
+    counts = {"M": 2, "L": 2, "C": 6, "Q": 4, "Z": 0}
+    while i < len(tokens):
+        cmd = tokens[i]
+        if cmd not in counts:
+            return None
+        i += 1
+        coords = []
+        while i < len(tokens) and not (len(tokens[i]) == 1 and tokens[i].isalpha()):
+            coords.append(float(tokens[i])); i += 1
+        size = counts[cmd]
+        if (size and (not coords or len(coords) % size)) or (not size and coords):
+            return None
+        points.extend(zip(coords[::2], coords[1::2]))
+    if not points:
+        return None
+    xs, ys = zip(*points)
+    return min(xs), min(ys), max(xs), max(ys)
+
+def merge_same_color_paths(tree):
+    tree = parse_svg(tree)
     if not cfg.MERGE_ADJACENT_PATHS:
         return tree
-
-    log.debug("Executing compound path merging by color signature.")
-    root = tree.getroot()
-    ns = {'svg': 'http://www.w3.org/2000/svg'}
-    
-    # Dictionary to hold the combined path data for each color
-    # Key: fill_color string, Value: list of 'd' string segments
-    color_paths = defaultdict(list)
-    
-    # Find all path elements
-    paths = root.xpath('.//svg:path', namespaces=ns)
-    
-    if not paths:
-        return tree
-        
-    # Extract data and remove the original individual paths from the DOM
-    for path in paths:
-        fill_color = path.get('fill')
-        d_attr = path.get('d')
-        
-        if fill_color and d_attr:
-            color_paths[fill_color].append(d_attr.strip())
-        
-        # Remove the node from its parent
-        parent = path.getparent()
-        if parent is not None:
-            parent.remove(path)
-            
-    # Create new combined paths and append them back to the root (or main group)
-    # Finding the first group <g> to append to, or root if no group exists
-    target_container = root.xpath('.//svg:g', namespaces=ns)
-    container = target_container[0] if target_container else root
-    
-    merged_count = 0
-    for color, d_segments in color_paths.items():
-        # Concatenate path strings with a space
-        combined_d = " ".join(d_segments)
-        
-        # Create a new compound <path> element
-        new_path = etree.Element(f"{{{ns['svg']}}}path")
-        new_path.set('fill', color)
-        new_path.set('d', combined_d)
-        
-        # Set stroke to none to ensure clean compound shapes
-        new_path.set('stroke', 'none')
-        
-        container.append(new_path)
-        merged_count += 1
-        
-    log.info(f"Merged {len(paths)} individual paths into {merged_count} compound paths.")
-    
+    allowed = {"fill", "fill-rule", "stroke", "transform", "d"}
+    for parent in list(tree.getroot().iter()):
+        if parent.tag not in {f"{{{SVG_NS}}}svg", f"{{{SVG_NS}}}g"}:
+            continue
+        previous = None
+        for current in list(parent):
+            if current.tag != f"{{{SVG_NS}}}path" or set(current.attrib) - allowed or current.get("stroke", "none") != "none":
+                previous = None; continue
+            attrs = {k: v for k, v in current.attrib.items() if k != "d"}
+            bounds = _bounds(current.get("d", ""))
+            if previous is not None and bounds:
+                old, old_attrs, old_bounds = previous
+                if attrs == old_attrs and old_bounds:
+                    a, b = old_bounds, bounds
+                    disjoint = a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1]
+                    if disjoint:
+                        old.set("d", old.get("d") + " " + current.get("d"))
+                        parent.remove(current)
+                        previous = (old, attrs, (min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3])))
+                        continue
+            previous = (current, attrs, bounds)
     return tree

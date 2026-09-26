@@ -1,96 +1,55 @@
-# utils/metadata_injector.py
-import subprocess
+"""Metadata writers never insert executable raw XML into PostScript."""
+import os
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from lxml import etree
+from utils.atomic_io import atomic_write
+from utils.svg_tools import parse_svg, serialize_svg, SVG_NS
 from utils.logger import log
-from utils.benchmark import benchmark
 
-@benchmark
-def inject_svg_metadata(svg_path: Path, title: str, keywords: list):
-    """Inject XMP metadata ke file SVG."""
-    try:
-        parser = etree.XMLParser(remove_blank_text=True)
-        tree = etree.parse(svg_path, parser)
-        root = tree.getroot()
-        
-        # Namespace definitions
-        nsmap = {
-            'x': "adobe:ns:meta/",
-            'rdf': "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-            'dc': "http://purl.org/dc/elements/1.1/"
-        }
-        
-        # Cari atau buat elemen metadata
-        metadata = root.find("{http://www.w3.org/2000/svg}metadata")
-        if metadata is None:
-            metadata = etree.SubElement(root, "{http://www.w3.org/2000/svg}metadata")
-        
-        # Hapus metadata lama
-        for child in list(metadata):
-            metadata.remove(child)
-        
-        # Buat struktur XMP
-        xmpmeta = etree.SubElement(metadata, "{adobe:ns:meta/}xmpmeta")
-        rdf = etree.SubElement(xmpmeta, "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}RDF")
-        desc = etree.SubElement(rdf, "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}Description")
-        
-        # Title
-        dc_title = etree.SubElement(desc, "{http://purl.org/dc/elements/1.1/}title")
-        alt = etree.SubElement(dc_title, "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}Alt")
-        li = etree.SubElement(alt, "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}li")
-        li.set("{http://www.w3.org/XML/1998/namespace}lang", "x-default")
+RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+DC = "http://purl.org/dc/elements/1.1/"
+
+def inject_svg_metadata(svg_path, title, keywords):
+    svg_path = Path(svg_path)
+    tree = parse_svg(svg_path.read_bytes())
+    root = tree.getroot()
+    for old in list(root.findall(f"{{{SVG_NS}}}metadata")):
+        root.remove(old)
+    block = etree.SubElement(root, f"{{{SVG_NS}}}metadata")
+    xmp = etree.SubElement(block, "{adobe:ns:meta/}xmpmeta", nsmap={"x": "adobe:ns:meta/", "rdf": RDF, "dc": DC})
+    rdf = etree.SubElement(xmp, f"{{{RDF}}}RDF")
+    desc = etree.SubElement(rdf, f"{{{RDF}}}Description", {f"{{{RDF}}}about": ""})
+    for field in ("title", "description"):
+        alt = etree.SubElement(etree.SubElement(desc, f"{{{DC}}}{field}"), f"{{{RDF}}}Alt")
+        li = etree.SubElement(alt, f"{{{RDF}}}li", {"{http://www.w3.org/XML/1998/namespace}lang": "x-default"})
         li.text = title
-        
-        # Keywords (dc:subject as rdf:Bag)
-        dc_subject = etree.SubElement(desc, "{http://purl.org/dc/elements/1.1/}subject")
-        bag = etree.SubElement(dc_subject, "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}Bag")
-        for kw in keywords:
-            li = etree.SubElement(bag, "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}li")
-            li.text = kw
-        
-        # Simpan
-        tree.write(svg_path, xml_declaration=True, encoding='utf-8', pretty_print=True)
-        log.info(f"Metadata injected to SVG: {svg_path.name}")
-        
-    except Exception as e:
-        log.error(f"Failed to inject SVG metadata: {e}")
+    bag = etree.SubElement(etree.SubElement(desc, f"{{{DC}}}subject"), f"{{{RDF}}}Bag")
+    for keyword in keywords:
+        etree.SubElement(bag, f"{{{RDF}}}li").text = keyword
+    atomic_write(svg_path, serialize_svg(tree))
+    return True
 
-
-@benchmark
-def inject_eps_metadata(eps_path: Path, title: str, keywords: list):
-    """Inject metadata ke file EPS menggunakan ExifTool."""
-    exiftool_path = shutil.which("exiftool")
-    if not exiftool_path:
-        log.warning("ExifTool tidak ditemukan! Install dengan: brew install exiftool")
-        return
-    
+def inject_eps_metadata(eps_path, title, keywords):
+    eps_path = Path(eps_path)
+    executable = shutil.which("exiftool")
+    if not executable:
+        log.warning("ExifTool unavailable; EPS keywords remain available in metadata.csv")
+        return False
+    from export.eps_export import validate_eps
+    fd, name = tempfile.mkstemp(suffix=".eps", dir=eps_path.parent)
+    os.close(fd)
     try:
-        # Build keyword arguments
-        kw_args = []
-        for kw in keywords:
-            kw_args.extend(["-keywords=" + kw])
-        
-        command = [
-            exiftool_path,
-            "-overwrite_original",
-            f"-Title={title}",
-            f"-Description={title}",
-            *kw_args,
-            str(eps_path)
-        ]
-        
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode == 0:
-            log.info(f"Metadata injected to EPS: {eps_path.name}")
-        else:
-            log.error(f"ExifTool failed: {result.stderr}")
-            
-    except Exception as e:
-        log.error(f"Failed to inject EPS metadata: {e}")
+        shutil.copy2(eps_path, name)
+        command = [executable, "-overwrite_original", "-charset", "UTF8", f"-XMP-dc:Title={title}", f"-XMP-dc:Description={title}", "-XMP-dc:Subject="]
+        command += [f"-XMP-dc:Subject+={word}" for word in keywords]
+        result = subprocess.run(command + [name], capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip())
+        validate_eps(name)
+        os.replace(name, eps_path)
+        return True
+    finally:
+        Path(name).unlink(missing_ok=True)

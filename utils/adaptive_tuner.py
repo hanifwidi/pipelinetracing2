@@ -11,6 +11,10 @@ def analyze_image_complexity(img_array: np.ndarray) -> dict:
     noise tidak dianggap "foto watercolor".
     """
     h, w = img_array.shape[:2]
+    if max(h, w) > 512:
+        scale = 512 / max(h, w)
+        img_array = cv2.resize(img_array, (max(1, round(w*scale)), max(1, round(h*scale))), interpolation=cv2.INTER_AREA)
+        h, w = img_array.shape[:2]
 
     # --- STEP 1: Hilangkan noise warna JPEG dengan quantize cepat ---
     # Reshape + kuantisasi ke 16 level per channel (4096 bucket) cukup
