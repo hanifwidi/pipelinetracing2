@@ -1,0 +1,10 @@
+{
+  "passed": false,
+  "megapixels": 24.9984,
+  "path_count": 529,
+  "mae": 0.125353,
+  "bbox_drift": 0.0,
+  "warnings": [
+    "Rendered colors/shapes differ substantially from the tracing input"
+  ]
+}

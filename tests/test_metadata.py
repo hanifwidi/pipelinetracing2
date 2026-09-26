@@ -38,7 +38,7 @@ def test_401_is_not_retried(monkeypatch):
     response.raise_for_status.side_effect=requests.HTTPError('unauthorized')
     post=Mock(return_value=response);monkeypatch.setattr(module.requests,'post',post)
     monkeypatch.setattr(module,'_pace',lambda _:None)
-    with pytest.raises(requests.HTTPError): _post('test','https://example.invalid',{}, {},2)
+    with pytest.raises(requests.RequestException, match='HTTP 401'): _post('test','https://example.invalid',{}, {},2)
     assert post.call_count==1
 
 def test_vision_cache_and_force_refresh(tmp_path,monkeypatch):

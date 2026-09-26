@@ -17,10 +17,14 @@ class VectorFactoryConfig:
     CACHE_DIR: Path = Path("cache")
     USE_MULTIPROCESS: bool = True
     NUM_WORKERS: int = min(4, max(1, multiprocessing.cpu_count() - 1))
-    METADATA_WORKERS: int = 2
+    METADATA_WORKERS: int = 1
     AI_REQUESTS_PER_MINUTE: int = 10
     AI_TIMEOUT: int = 30
     AI_RETRIES: int = 2
+    AI_MAX_RETRY_WAIT: float = 180.0  # Total sleep budget per model/request.
+    # Account-tested preference; environment variables override these defaults.
+    GEMINI_MODEL: str = "gemini-3.5-flash"
+    GEMINI_FALLBACK_MODELS: tuple = ("gemini-flash-latest", "gemini-3.7-flash")
     DEBUG_MODE: bool = False
     MAX_SIZE: int = 2048
     STRIP_CAPTIONS: bool = False

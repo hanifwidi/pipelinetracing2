@@ -1,0 +1,8 @@
+{
+  "passed": true,
+  "megapixels": 24.9984,
+  "path_count": 151,
+  "mae": 0.032486,
+  "bbox_drift": 0.0,
+  "warnings": []
+}

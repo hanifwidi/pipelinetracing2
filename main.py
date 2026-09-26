@@ -185,12 +185,66 @@ def finalize(stage, meta, no_archive):
     return stage
 
 
+def resume_metadata(args, manifest, manifest_path, manual):
+    """Resume saved pending assets without tracing or revisiting ready assets."""
+    stages = [dict(s) for s in manifest["assets"].values() if s.get("status") == "needs_metadata"]
+    if not stages:
+        log.info("No assets with status needs_metadata")
+        return 0
+    counts, failures = Counter(), 0
+    with ThreadPoolExecutor(max_workers=cfg.METADATA_WORKERS) as pool:
+        pending = {}
+        for stage in stages:
+            try:
+                svg = Path(stage["svg"])
+                parse_svg(svg.read_bytes())
+                if stage.get("eps") and not Path(stage["eps"]).is_file():
+                    raise ValueError("Saved EPS is missing; restore it or run tracing normally")
+                if not isinstance(stage.get("quality", {}).get("passed"), bool):
+                    raise ValueError("Saved QA result is missing; run tracing normally")
+                preview = Path(stage["preview"])
+                if not preview.is_file():
+                    render_preview(svg, preview)
+                # Check preview even if manual metadata is used, to keep QA inputs valid.
+                with Image.open(preview) as im:
+                    im.verify()
+                pending[pool.submit(_metadata, stage, manual, args.force_metadata)] = stage
+            except Exception as exc:
+                failures += 1
+                log.error("Cannot resume %s: %s", stage.get("basename", "asset"), exc)
+        for future in as_completed(pending):
+            stage = pending[future]
+            try:
+                meta = future.result()
+                no_archive = args.no_archive
+                # Never archive an input that has been replaced since tracing.
+                if not no_archive:
+                    sources = stage.get("sources", [])
+                    intact = bool(sources) and all(Path(p).is_file() and content_hash(p) == stage["asset_id"] for p in sources)
+                    if not intact:
+                        log.warning("%s: source missing/changed; keeping inputs in place", stage["basename"])
+                        no_archive = True
+                stage = finalize(stage, meta, no_archive)
+                manifest["assets"][stage["asset_id"]] = stage
+                write_json(manifest_path, manifest)
+                counts[stage["status"]] += 1
+            except Exception as exc:
+                # Keep the original needs_metadata entry and input on repair errors.
+                failures += 1
+                log.error("Metadata resume failed for %s: %s", stage.get("basename", "asset"), type(exc).__name__)
+    log.info("Metadata resume | ready=%d | needs_metadata=%d | needs_review=%d | errors=%d",
+             counts["ready"], counts["needs_metadata"], counts["needs_review"], failures)
+    return 1 if failures else 0
+
+
 def run_pipeline(args):
     setup_directories()
-    find_inkscape()  # Fail before processing inputs if previews cannot be rendered.
     manual = _load_manual(args.metadata_csv)
     manifest_path = cfg.TRACKING_FOLDER / "pipeline_manifest.json"
     manifest = read_json(manifest_path, {"version": PIPELINE_VERSION, "assets": {}})
+    if args.resume_metadata:
+        return resume_metadata(args, manifest, manifest_path, manual)
+    find_inkscape()  # Fail before processing inputs if previews cannot be rendered.
     images = get_image_files(cfg.INPUT_FOLDER)
     if not images:
         log.info("No pending images in %s", cfg.INPUT_FOLDER)
@@ -274,6 +328,7 @@ def main(argv=None):
     ap.add_argument("--target-mp", type=float, default=cfg.TARGET_MEGAPIXELS)
     ap.add_argument("--max-size", type=int, default=cfg.MAX_SIZE)
     ap.add_argument("--metadata-csv", type=Path, help="Reviewed metadata; bypass AI for matching filenames")
+    ap.add_argument("--resume-metadata", action="store_true", help="Only repair saved needs_metadata assets; do not trace or touch ready assets")
     ap.add_argument("--force", action="store_true", help="Rebuild tracing cache")
     ap.add_argument("--force-metadata", action="store_true", help="Regenerate cached AI metadata")
     args = ap.parse_args(argv)

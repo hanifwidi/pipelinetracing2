@@ -40,7 +40,9 @@ Metadata AI memakai Gemini lalu OpenRouter jika key masing-masing tersedia:
 export GEMINI_API_KEY="isi-key-di-terminal-lokal"
 # Opsional:
 export OPENROUTER_API_KEY="isi-key-di-terminal-lokal"
-export GEMINI_MODEL="gemini-2.5-flash"
+export GEMINI_MODEL="gemini-3.5-flash"
+# Urutan cadangan dapat diganti; isi kosong untuk menonaktifkan fallback model:
+export GEMINI_FALLBACK_MODELS="gemini-flash-latest,gemini-3.7-flash"
 # Pilih model vision yang tersedia pada akunmu bila dibutuhkan:
 # export OPENROUTER_MODEL="provider/model"
 python main.py --workers 2 --metadata-workers 1 --ai-rpm 10 --eps
@@ -49,6 +51,44 @@ python main.py --workers 2 --metadata-workers 1 --ai-rpm 10 --eps
 Key dibaca dari environment, bukan otomatis dari file `.env`. Jangan memasukkan
 key ke source atau Git. Preview gambar dikirim ke provider yang dikonfigurasi.
 Model dan kuota mengikuti akun provider; ketersediaan API tidak diasumsikan.
+
+Default model di atas mengikuti model yang berhasil diuji pengguna pada akun ini;
+bukan jaminan akses untuk semua akun. Tidak ada pencarian model Gemini otomatis.
+HTTP 404 melewati model tersebut selama proses berjalan. HTTP 401/403 menghentikan
+provider tersebut untuk run ini. Retry 429/5xx membaca `Retry-After` (detik/tanggal),
+`google.rpc.RetryInfo.retryDelay`, dan pesan `retry in Xs`; jeda server tidak
+dipotong menjadi 30 detik. Tanpa petunjuk server, retry memakai exponential backoff.
+Default dua retry setelah percobaan awal, dengan anggaran jeda retry 180 detik
+per model/request (`AI_RETRIES`, `AI_MAX_RETRY_WAIT` di `config.py`). Jika petunjuk
+jeda melebihi anggaran, request tidak diulang lebih awal; coba fallback yang tersedia.
+
+Metadata worker default satu; request ke setiap provider diserialkan dan semua
+model provider tersebut berbagi pacing `--ai-rpm`. Menambah worker tidak menaikkan
+batas RPM. Pacing hanya mencakup proses ini, bukan aplikasi lain di project API sama.
+Kuota harian atau kuota nol yang teridentifikasi dari `quotaId`/`quotaValue`
+dihentikan untuk run ini. Angka `limit: 20` saja tidak membuktikan kuota per menit.
+Cooldown kuota project dibagi antar model; kuota dengan dimensi model berlaku ke
+model itu. OpenRouter dicoba setelah Gemini tidak berhasil jika key dikonfigurasi.
+Tanpa `OPENROUTER_MODEL`, discovery hanya memilih maksimal dua model `:free`
+yang menyatakan menerima gambar. Hasil tetap bisa pending jika tidak ada kapasitas.
+
+Untuk melanjutkan hanya aset yang metadata-nya belum lengkap:
+
+```bash
+python main.py --resume-metadata --metadata-workers 1 --ai-rpm 5 --no-archive
+# Bisa digabungkan dengan CSV manual:
+python main.py --resume-metadata --metadata-csv manual_metadata.csv --no-archive
+```
+
+Mode ini membaca `tracking/pipeline_manifest.json`, memilih status `needs_metadata`,
+dan memakai SVG, preview, serta QA yang tersimpan. Tidak tracing ulang, tidak
+memproses `ready`/`needs_review`, dan tidak membutuhkan isi folder input untuk
+memilih aset. Preview yang hilang dirender ulang dengan Inkscape. SVG/EPS atau QA
+yang hilang menghasilkan error dan mempertahankan status pending; lakukan run
+tracing normal untuk memperbaikinya. `--no-archive` mempertahankan input; tanpa
+flag itu, hanya input asli yang hash-nya masih cocok boleh diarsipkan saat ready.
+Opsi tracing (grid/caption/ukuran/EPS) tidak mengubah artefak dalam mode resume.
+Status ready tetap bergantung pada QA, bukan hanya metadata sukses.
 
 Alternatif tanpa API: siapkan CSV judul/keyword yang sudah diperiksa:
 

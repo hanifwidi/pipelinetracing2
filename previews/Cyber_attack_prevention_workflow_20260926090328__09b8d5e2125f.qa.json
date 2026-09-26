@@ -1,0 +1,10 @@
+{
+  "passed": false,
+  "megapixels": 24.9984,
+  "path_count": 181,
+  "mae": 0.030498,
+  "bbox_drift": 0.138354,
+  "warnings": [
+    "Artwork position or occupied area changed"
+  ]
+}
