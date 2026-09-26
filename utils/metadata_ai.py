@@ -17,7 +17,7 @@ from config import cfg
 from utils.atomic_io import read_json, write_json
 from utils.logger import log
 
-PROMPT_VERSION = "2026-09-relevance-v2"
+PROMPT_VERSION = "2026-09-relevance-v3"
 PROMPT = """Describe exactly what is visible in this vector artwork for Adobe Stock.
 Return JSON only: {"title": "...", "keywords": ["...", ...]}.
 Write a clear English title, ideally under 70 characters, maximum 90.
@@ -27,6 +27,9 @@ Describe the actual style (line, flat, silhouette, etc.) only when visible.
 Use relevant buyer concepts only when supported by this particular image.
 Do not pad with generic uses like banner, template, marketing, mockup or trending.
 Do not invent objects, brands, names, or unseen characteristics.
+Use a color keyword only when clearly supported; a silhouette can be navy, not black.
+Do not infer white background or transparency from this composited preview.
+Prefer the precise object name; do not add related but different objects as synonyms.
 A keyword can have up to three words. Avoid duplicate singular/plural variants.
 Do not describe every image as an icon set if it is not one."""
 _rate_lock = threading.Lock()

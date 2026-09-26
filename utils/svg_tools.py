@@ -5,6 +5,7 @@ from lxml import etree
 from config import cfg
 
 SVG_NS = "http://www.w3.org/2000/svg"
+ICON_TYPES = ("icon", "icon-sheet")
 NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 TOKEN = re.compile(rf"[AaCcHhLlMmQqSsTtVvZz]|{NUMBER}")
 
@@ -33,11 +34,17 @@ def pixel_length(value):
         raise ValueError("SVG dimensions must be finite and positive")
     return number
 
-def harden_for_adobe(value, target_mp=None):
+def harden_for_adobe(value, target_mp=None, asset_type=None):
     tree = parse_svg(value)
     root = tree.getroot()
     target = cfg.TARGET_MEGAPIXELS if target_mp is None else target_mp
-    if not cfg.MIN_MEGAPIXELS <= target <= cfg.MAX_MEGAPIXELS:
+    asset_type = asset_type or cfg.ASSET_TYPE
+    if not math.isfinite(target) or target <= 0:
+        raise ValueError("Target artboard area must be positive and finite")
+    if asset_type in ICON_TYPES:
+        if target > cfg.ICON_MAX_SIZE ** 2 / 1_000_000:
+            raise ValueError("Icon artboard target must not exceed 16 MP")
+    elif not cfg.MIN_MEGAPIXELS <= target <= cfg.MAX_MEGAPIXELS:
         raise ValueError("Target artboard must be between 15 and 65 megapixels")
     if root.get("viewBox"):
         bounds = [float(v) for v in re.split(r"[\s,]+", root.get("viewBox").strip())]
@@ -49,12 +56,19 @@ def harden_for_adobe(value, target_mp=None):
     if max(width, height) / min(width, height) > 1000:
         raise ValueError("Extreme SVG aspect ratio requires manual review")
     scale = math.sqrt(target * 1_000_000 / (width * height))
+    if asset_type in ICON_TYPES:
+        scale = min(scale, cfg.ICON_MAX_SIZE / max(width, height))
     out_w, out_h = max(1, round(width * scale)), max(1, round(height * scale))
-    # Rounding at the exact 15/65 MP boundary must not violate the bounds.
-    while out_w * out_h < cfg.MIN_MEGAPIXELS * 1_000_000:
-        out_w += 1
-    while out_w * out_h > cfg.MAX_MEGAPIXELS * 1_000_000:
-        out_w -= 1
+    if asset_type in ICON_TYPES:
+        minimum = cfg.ICON_SHEET_MIN_SIZE if asset_type == "icon-sheet" else cfg.ICON_MIN_SIZE
+        if min(out_w, out_h) < minimum:
+            raise ValueError(f"{asset_type} artboard sides must be {minimum}-4000px; review aspect ratio/target")
+    else:
+        # Rounding at the exact 15/65 MP boundary must not violate the bounds.
+        while out_w * out_h < cfg.MIN_MEGAPIXELS * 1_000_000:
+            out_w += 1
+        while out_w * out_h > cfg.MAX_MEGAPIXELS * 1_000_000:
+            out_w -= 1
     root.set("viewBox", " ".join(format(v, ".12g") for v in bounds))
     root.set("width", str(out_w))
     root.set("height", str(out_h))

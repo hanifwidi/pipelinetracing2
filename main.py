@@ -4,6 +4,7 @@ import csv
 import hashlib
 import importlib.metadata
 import json
+import math
 import multiprocessing
 import os
 import re
@@ -24,6 +25,7 @@ from export.eps_export import convert_svg_to_eps, find_inkscape
 from export.svg_export import save_svg
 from preprocess.resize import resize_image
 from tracing.vtracer_wrapper import trace_image_to_svg
+from tracing.icon_trace import trace_icon_source, IconSourceNeedsReview
 from tracing.svg_optimizer import optimize_svg_tree
 from tracing.merge_paths import merge_same_color_paths
 from tracing.remove_duplicate_nodes import clean_duplicate_nodes
@@ -37,10 +39,10 @@ from utils.metadata_ai import generate_metadata, _clean_metadata
 from utils.metadata_injector import inject_svg_metadata, inject_eps_metadata
 from utils.quality import inspect_svg, render_preview
 from utils.quarantine import move_to_quarantine
-from utils.svg_tools import harden_for_adobe, parse_svg
+from utils.svg_tools import harden_for_adobe, parse_svg, ICON_TYPES
 from utils.tracking import record_asset
 
-PIPELINE_VERSION = "3.0"
+PIPELINE_VERSION = "3.1-icons"
 
 
 def content_hash(path):
@@ -52,7 +54,7 @@ def content_hash(path):
 
 
 def tracing_signature():
-    names = ["MAX_SIZE", "STRIP_CAPTIONS", "GRID_ROWS", "GRID_COLS", "OPTIMIZE_SVG", "SVG_PRECISION", "MERGE_ADJACENT_PATHS", "REMOVE_DUPLICATE_NODES", "TARGET_MEGAPIXELS"]
+    names = ["MAX_SIZE", "STRIP_CAPTIONS", "GRID_ROWS", "GRID_COLS", "OPTIMIZE_SVG", "SVG_PRECISION", "MERGE_ADJACENT_PATHS", "REMOVE_DUPLICATE_NODES", "TARGET_MEGAPIXELS", "ASSET_TYPE", "ICON_MAX_SIZE", "ICON_MIN_SIZE", "ICON_SHEET_MIN_SIZE"]
     values = {key: getattr(cfg, key) for key in names}
     values.update(version=PIPELINE_VERSION, vtracer=importlib.metadata.version("vtracer"))
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[:16]
@@ -71,12 +73,23 @@ def process_single_image(job):
     folder = cfg.CACHE_DIR / "tracing" / job["asset_id"] / job["signature"]
     folder.mkdir(parents=True, exist_ok=True)
     reference, raw_svg = folder / "reference.png", folder / "raw.svg"
-    cache_hit = raw_svg.exists() and reference.exists() and not job.get("force")
+    alpha_path, analysis_path = folder / "expected_alpha.png", folder / "analysis.json"
+    icon_mode = cfg.ASSET_TYPE in ICON_TYPES
+    try:
+        trace_info = read_json(analysis_path, {})
+        if not isinstance(trace_info, dict) or not isinstance(trace_info.get("analysis"), dict) or not isinstance(trace_info.get("source_issues"), list):
+            trace_info = {}
+    except (ValueError, OSError):
+        trace_info = {}
+    cache_hit = raw_svg.exists() and reference.exists() and bool(trace_info) and not job.get("force")
     if cache_hit:
         try:
             parse_svg(raw_svg.read_bytes())
             with Image.open(reference) as im:
                 im.verify()
+            if icon_mode and not trace_info["source_issues"]:
+                with Image.open(alpha_path) as im:
+                    im.verify()
         except Exception as exc:
             log.warning("Rebuilding invalid trace cache: %s", type(exc).__name__)
             cache_hit = False
@@ -86,10 +99,24 @@ def process_single_image(job):
             if image.shape[0] < cfg.GRID_ROWS or image.shape[1] < cfg.GRID_COLS:
                 raise ValueError("Caption grid exceeds image dimensions")
             image = strip_captions(image, cfg.GRID_ROWS, cfg.GRID_COLS)
-        params = get_adaptive_vtracer_params(analyze_image_complexity(image))
-        svg = trace_image_to_svg(image, params)
+        analysis = analyze_image_complexity(image)
+        params = get_adaptive_vtracer_params(analysis)
+        source_issues = []
+        if icon_mode:
+            alpha_path.unlink(missing_ok=True)
+            try:
+                svg, expected_alpha = trace_icon_source(image, analysis, params)
+                Image.fromarray(expected_alpha).save(alpha_path)
+            except IconSourceNeedsReview as exc:
+                source_issues.append(str(exc))
+                log.warning("Icon source needs review: %s", exc)
+                svg = trace_image_to_svg(image, params)
+        else:
+            svg = trace_image_to_svg(image, params)
         Image.fromarray(image).save(reference)
         atomic_write(raw_svg, svg)
+        trace_info = {"analysis": analysis, "source_issues": source_issues}
+        write_json(analysis_path, trace_info)
     svg = raw_svg.read_text(encoding="utf-8")
     if cfg.OPTIMIZE_SVG:
         svg = optimize_svg_tree(svg)
@@ -100,7 +127,10 @@ def process_single_image(job):
     save_svg(svg, path.name, svg_path)
     preview = cfg.PREVIEW_FOLDER / (job["basename"] + ".png")
     render_preview(svg_path, preview)
-    quality = inspect_svg(svg_path, preview, reference)
+    quality = inspect_svg(svg_path, preview, reference,
+                          alpha_reference=alpha_path if alpha_path.exists() else None)
+    quality["warnings"].extend(trace_info["source_issues"])
+    quality["passed"] = not quality["warnings"]
     eps_path = None
     if cfg.EXPORT_EPS:
         eps_path = cfg.OUTPUT_EPS_FOLDER / (job["basename"] + ".eps")
@@ -108,6 +138,8 @@ def process_single_image(job):
             raise RuntimeError("EPS export/validation failed")
     result = {**job, "svg": str(svg_path.resolve()), "eps": str(eps_path.resolve()) if eps_path else None,
               "preview": str(preview.resolve()), "reference": str(reference.resolve()), "quality": quality,
+              "asset_type": cfg.ASSET_TYPE, "analysis": trace_info["analysis"],
+              "alpha_reference": str(alpha_path.resolve()) if alpha_path.exists() else None,
               "trace_cache_hit": cache_hit, "production_seconds": round(time.monotonic()-start, 3)}
     write_json(cfg.PREVIEW_FOLDER / (job["basename"] + ".qa.json"), quality)
     return result
@@ -325,7 +357,10 @@ def main(argv=None):
     ap.add_argument("--skip-opt", action="store_true", default=os.getenv("SKIP_OPT") == "1")
     ap.add_argument("--strip-captions", action="store_true")
     ap.add_argument("--grid", default="4x4", help="Caption grid, e.g. 4x4 or 3x5")
-    ap.add_argument("--target-mp", type=float, default=cfg.TARGET_MEGAPIXELS)
+    ap.add_argument("--asset-type", choices=("illustration", *ICON_TYPES), default=cfg.ASSET_TYPE,
+                    help="Icon modes treat a flat white source background and white holes as negative space")
+    ap.add_argument("--target-mp", type=float, default=None,
+                    help="Default 25 for illustrations; 16 capped at 4000px per side for icons")
     ap.add_argument("--max-size", type=int, default=cfg.MAX_SIZE)
     ap.add_argument("--metadata-csv", type=Path, help="Reviewed metadata; bypass AI for matching filenames")
     ap.add_argument("--resume-metadata", action="store_true", help="Only repair saved needs_metadata assets; do not trace or touch ready assets")
@@ -340,13 +375,21 @@ def main(argv=None):
             raise ValueError()
     except ValueError:
         ap.error("--grid must have positive rows x columns, e.g. 4x4")
-    if not cfg.MIN_MEGAPIXELS <= args.target_mp <= cfg.MAX_MEGAPIXELS:
-        ap.error("--target-mp must be between 15 and 65")
+    if args.target_mp is None:
+        args.target_mp = 16.0 if args.asset_type in ICON_TYPES else cfg.TARGET_MEGAPIXELS
+    if not math.isfinite(args.target_mp) or args.target_mp <= 0:
+        ap.error("--target-mp must be positive and finite")
+    if args.asset_type in ICON_TYPES:
+        if args.target_mp > 16:
+            ap.error("Icon profiles support at most 16 MP and 4000px per side")
+    elif not cfg.MIN_MEGAPIXELS <= args.target_mp <= cfg.MAX_MEGAPIXELS:
+        ap.error("Illustration --target-mp must be between 15 and 65")
     if args.input:
         cfg.INPUT_FOLDER = args.input
     cfg.NUM_WORKERS, cfg.METADATA_WORKERS = args.workers, args.metadata_workers
     cfg.AI_REQUESTS_PER_MINUTE = args.ai_rpm
     cfg.EXPORT_EPS = args.eps
+    cfg.ASSET_TYPE = args.asset_type
     cfg.OPTIMIZE_SVG = not args.skip_opt
     cfg.STRIP_CAPTIONS, cfg.GRID_ROWS, cfg.GRID_COLS = args.strip_captions, rows, cols
     cfg.TARGET_MEGAPIXELS, cfg.MAX_SIZE = args.target_mp, args.max_size

@@ -1,15 +1,17 @@
-# Memasang pembaruan dari versi cf4c9b4
+# Memasang pembaruan dari Pipeline 3.0 / 3.1
 
 Paket pembaruan hanya berisi source, konfigurasi, dokumentasi, dan tes.
 Folder gambar, output, cache, log, dan catatan produksi tidak disertakan.
 
 1. Hentikan batch yang sedang berjalan.
-2. Salin isi folder `updated-files/` dari paket ke folder proyek dengan struktur
-   folder yang sama. Jika memakai Git, alternatifnya jalankan
-   `git apply --check changes.patch` lalu `git apply changes.patch` pada checkout
-   commit `cf4c9b4` yang bersih. Pilih salah satu cara penerapan.
+2. Ekstrak ZIP dan salin berkas dengan struktur folder yang sama ke folder proyek.
+   Jika memakai Git dan checkout berawal dari commit `a1328c0`, alternatifnya
+   jalankan `git apply --check pipelinetracing2_icon_tracing_update.patch` lalu
+   `git apply pipelinetracing2_icon_tracing_update.patch`. Pilih satu cara.
 3. Cocokkan pengaturan lokal pada `config.py` dengan versi baru bila sebelumnya
-   file itu sudah dikustomisasi. Instal ulang dependency:
+   file itu sudah dikustomisasi. Pembaruan ini tidak menambah dependency; pada
+   instalasi Catalina gunakan pin `requirements.txt` yang sudah ada. Instal ulang
+   hanya bila environment belum mengikuti file tersebut:
 
 ```bash
 pip install -r requirements.txt
@@ -22,6 +24,18 @@ pip install -r requirements.txt
 ```bash
 python main.py --workers 2 --metadata-workers 1 --eps --no-archive
 ```
+
+Untuk lembar ikon flat seperti sampel geometris, jalankan pengujian terpisah:
+
+```bash
+python main.py --asset-type icon-sheet --workers 1 --metadata-workers 1 \
+  --metadata-csv manual_metadata.csv --eps --no-archive
+```
+
+`--asset-type` masuk ke signature cache. Aset yang pernah ditrace pada profil
+ilustrasi akan dibangun ulang ketika dijalankan dengan profil ikon. Salin input
+yang sudah dipindahkan ke `input_processed/` kembali ke `input/` bila ingin
+meregenerasi SVG lama; output lama tidak diubah otomatis.
 
 Periksa `previews/`, `.qa.json`, serta ringkasan ready/needs_metadata/needs_review.
 Tanpa API key, status needs_metadata memang diharapkan. Untuk menyelesaikannya,
@@ -46,6 +60,10 @@ isi environment API atau gunakan `--metadata-csv` berisi metadata yang ditinjau.
 - Script XMP lama diganti writer ExifTool. File EPS tidak lagi disisipi XML mentah.
 - `repair_metadata.py` tidak men-truncate seluruh metadata.csv atau menambahkan
   baris untuk SVG yang tidak ada. Output legacy tanpa QA tetap perlu ditinjau.
+- Profil `icon`/`icon-sheet` memverifikasi alpha melalui `expected_alpha.png` di
+  cache dan menahan hasil yang masih memiliki bidang putih pada background atau
+  lubang. Profil ini bersifat opt-in karena penghapusan warna putih tidak aman
+  untuk ilustrasi umum.
 
 Ketersediaan model AI dan pembacaan metadata oleh Adobe Contributor Portal perlu
 diverifikasi pada akun pengguna. Implementasi dan tes tidak melakukan upload

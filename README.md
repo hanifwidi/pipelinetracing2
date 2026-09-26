@@ -31,6 +31,23 @@ Simpan gambar di `input/`, lalu jalankan dari folder proyek:
 python main.py --workers 2 --metadata-workers 1 --eps
 ```
 
+Untuk aset berupa lembar ikon flat dengan latar putih polos, gunakan profil ikon
+secara eksplisit:
+
+```bash
+python main.py --asset-type icon-sheet --workers 2 --metadata-workers 1 --eps --no-archive
+```
+
+Profil ini membuat background dan ruang kosong putih menjadi transparan, lalu
+menelusuri tiap warna foreground sebagai compound path agar lubang roda, handle,
+dan detail serupa tetap kosong. Artboard default adalah 16 MP dan dibatasi
+4000 px per sisi. `icon` menerima aset tunggal dengan sisi minimal 50 px;
+`icon-sheet` memakai minimal 1000 px per sisi. Input bergradasi, bertekstur,
+berlatar selain putih, atau memiliki detail putih yang ambigu ditahan sebagai
+`needs_review`, sehingga pipeline tidak menebak bagian yang harus transparan.
+Gunakan profil `illustration` (default) untuk gambar yang memang membutuhkan
+bidang putih sebagai bagian objek.
+
 Tanpa API key, SVG/EPS dan preview tetap dibuat dengan status `needs_metadata`.
 Input yang belum siap tetap tersedia untuk diproses ulang.
 
@@ -125,7 +142,8 @@ sehingga opsi juga berlaku pada multiprocessing `spawn` di macOS/Windows.
 ## Alur aktif dan keluaran
 
 1. Baca/resize gambar, komposit transparansi di atas putih; hapus caption bila diminta.
-2. Analisis kompleksitas pada sampel kecil; trace gambar dengan VTracer.
+2. Analisis kompleksitas pada sampel kecil; profil ikon memakai trace mask biner
+   per warna, sedangkan profil ilustrasi memakai VTracer warna biasa.
 3. Optimasi path konservatif, simpan `viewBox`, pertahankan rasio, dan atur artboard.
 4. Render SVG ke PNG dengan Inkscape, bandingkan warna/posisi dengan input tracing.
 5. Ekspor EPS opsional melalui Inkscape. Ukuran EPS dinormalisasi ke satuan point
@@ -156,8 +174,10 @@ Cache metadata menyertakan versi prompt. CSV diperbarui berdasarkan filename,
 bukan ditambah berulang. Satu workspace hanya menerima satu pipeline/repair
 sekaligus; CSV tracking juga memakai lock dan penggantian file secara atomik.
 
-Batas teknis default: artboard 15–65 MP, file maksimal 45 MB, tanpa gambar raster
-tertanam. Preview juga memeriksa perbedaan warna dan pergeseran area artwork.
+Batas teknis default ilustrasi: artboard 15–65 MP, file maksimal 45 MB, tanpa
+gambar raster tertanam. Profil ikon memakai batas sisi dan maksimal 16 MP seperti
+yang dijelaskan di atas. Preview juga memeriksa perbedaan warna, pergeseran area
+artwork, serta transparansi tiap foreground dan negative-space component.
 Halusnya detail kecil, ketepatan objek, dan kelayakan komersial tetap perlu
 pemeriksaan manusia. Penggabungan path warna sama default OFF; jika diaktifkan,
 hanya path bersebelahan dengan atribut identik dan area yang terbukti terpisah

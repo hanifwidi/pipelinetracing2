@@ -30,6 +30,10 @@ class VectorFactoryConfig:
     STRIP_CAPTIONS: bool = False
     GRID_ROWS: int = 4
     GRID_COLS: int = 4
+    ASSET_TYPE: str = "illustration"
+    ICON_MAX_SIZE: int = 4000
+    ICON_MIN_SIZE: int = 50
+    ICON_SHEET_MIN_SIZE: int = 1000
     TARGET_MEGAPIXELS: float = 25.0
     MIN_MEGAPIXELS: float = 15.0
     MAX_MEGAPIXELS: float = 65.0
